@@ -1,10 +1,29 @@
-import React, { createContext, useContext, useState, useCallback } from "react";
-import type { Itinerary, ItineraryItem } from "@/types/itinerary";
+import React, { createContext, useContext, useState, useCallback, useMemo } from "react";
+import type { Itinerary, ItineraryItem, PaymentStatus, Voucher } from "@/types/itinerary";
 
 import maldivesImg from "@/assets/maldives-resort.jpg";
 import swissImg from "@/assets/swiss-alps.jpg";
 import dubaiImg from "@/assets/dubai-skyline.jpg";
 import santoriniImg from "@/assets/hero-santorini.jpg";
+
+// --- Pricing helpers ---
+export function calcBufferedNetUSD(netPrice: number, bufferPercent: number): number {
+  return netPrice * (1 + bufferPercent / 100);
+}
+export function calcBufferedNetPHP(netPrice: number, bufferPercent: number, exchangeRate: number): number {
+  return calcBufferedNetUSD(netPrice, bufferPercent) * exchangeRate;
+}
+export function calcMarkupAmountPHP(netPrice: number, bufferPercent: number, exchangeRate: number, markupPercent: number): number {
+  return calcBufferedNetPHP(netPrice, bufferPercent, exchangeRate) * (markupPercent / 100);
+}
+export function calcVatOnMarkupPHP(netPrice: number, bufferPercent: number, exchangeRate: number, markupPercent: number): number {
+  return calcMarkupAmountPHP(netPrice, bufferPercent, exchangeRate, markupPercent) * 0.12;
+}
+export function calcClientPricePHP(netPrice: number, bufferPercent: number, exchangeRate: number, markupPercent: number): number {
+  const bufferedPHP = calcBufferedNetPHP(netPrice, bufferPercent, exchangeRate);
+  const markup = calcMarkupAmountPHP(netPrice, bufferPercent, exchangeRate, markupPercent);
+  return bufferedPHP + markup;
+}
 
 const defaultItems: ItineraryItem[] = [
   {
@@ -74,7 +93,38 @@ const defaultItinerary: Itinerary = {
   endDate: "2026-04-20",
   items: defaultItems,
   agencyName: "Your Agency Name",
+  exchangeRate: 56,
+  currencyBufferPercent: 3,
+  paymentStatus: "pending",
+  termsAccepted: false,
+  inclusions: [
+    "Business class round-trip flights",
+    "5 nights luxury beach villa accommodation",
+    "All meals and premium beverages",
+    "Private seaplane transfers",
+    "Sunset dolphin cruise experience",
+    "Personal butler service",
+  ],
+  exclusions: [
+    "Travel insurance",
+    "Visa fees (if applicable)",
+    "Spa treatments and wellness packages",
+    "Additional excursions not listed",
+    "Gratuities and personal expenses",
+  ],
+  vouchers: [],
 };
+
+interface PricingSummary {
+  totalNetUSD: number;
+  totalBufferedNetUSD: number;
+  totalBufferedNetPHP: number;
+  totalMarkupPHP: number;
+  totalVatOnMarkupPHP: number;
+  totalClientPHP: number;
+  totalGrossProfitPHP: number;
+  totalNetProfitPHP: number;
+}
 
 interface ItineraryContextType {
   itinerary: Itinerary;
@@ -83,6 +133,16 @@ interface ItineraryContextType {
   removeItem: (id: string) => void;
   addItem: (item: ItineraryItem) => void;
   updateAgencyName: (name: string) => void;
+  setExchangeRate: (rate: number) => void;
+  setCurrencyBuffer: (percent: number) => void;
+  setGlobalMarkup: (percent: number) => void;
+  setPaymentStatus: (status: PaymentStatus) => void;
+  setTermsAccepted: (accepted: boolean) => void;
+  updateInclusions: (inclusions: string[]) => void;
+  updateExclusions: (exclusions: string[]) => void;
+  addVoucher: (voucher: Voucher) => void;
+  removeVoucher: (id: string) => void;
+  pricing: PricingSummary;
   totalNet: number;
   totalFinal: number;
 }
@@ -136,12 +196,113 @@ export const ItineraryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setItinerary((prev) => ({ ...prev, agencyName: name }));
   }, []);
 
+  const setExchangeRate = useCallback((rate: number) => {
+    setItinerary((prev) => ({ ...prev, exchangeRate: rate }));
+  }, []);
+
+  const setCurrencyBuffer = useCallback((percent: number) => {
+    setItinerary((prev) => ({ ...prev, currencyBufferPercent: percent }));
+  }, []);
+
+  const setGlobalMarkup = useCallback((percent: number) => {
+    setItinerary((prev) => ({
+      ...prev,
+      items: prev.items.map((item) =>
+        item.locked ? item : { ...item, markupPercent: percent, finalPrice: Math.round(item.netPrice * (1 + percent / 100)) }
+      ),
+    }));
+  }, []);
+
+  const setPaymentStatus = useCallback((status: PaymentStatus) => {
+    setItinerary((prev) => ({ ...prev, paymentStatus: status }));
+  }, []);
+
+  const setTermsAccepted = useCallback((accepted: boolean) => {
+    setItinerary((prev) => ({ ...prev, termsAccepted: accepted }));
+  }, []);
+
+  const updateInclusions = useCallback((inclusions: string[]) => {
+    setItinerary((prev) => ({ ...prev, inclusions }));
+  }, []);
+
+  const updateExclusions = useCallback((exclusions: string[]) => {
+    setItinerary((prev) => ({ ...prev, exclusions }));
+  }, []);
+
+  const addVoucher = useCallback((voucher: Voucher) => {
+    setItinerary((prev) => ({ ...prev, vouchers: [...prev.vouchers, voucher] }));
+  }, []);
+
+  const removeVoucher = useCallback((id: string) => {
+    setItinerary((prev) => {
+      const removed = prev.vouchers.find((v) => v.id === id);
+      if (removed) URL.revokeObjectURL(removed.url);
+      return { ...prev, vouchers: prev.vouchers.filter((v) => v.id !== id) };
+    });
+  }, []);
+
   const totalNet = itinerary.items.reduce((sum, item) => sum + item.netPrice, 0);
   const totalFinal = itinerary.items.reduce((sum, item) => sum + item.finalPrice, 0);
 
+  const pricing: PricingSummary = useMemo(() => {
+    const { exchangeRate, currencyBufferPercent, items } = itinerary;
+    let totalNetUSD = 0;
+    let totalBufferedNetUSD = 0;
+    let totalBufferedNetPHP = 0;
+    let totalMarkupPHP = 0;
+    let totalVatOnMarkupPHP = 0;
+    let totalClientPHP = 0;
+
+    for (const item of items) {
+      const netUSD = item.netPrice;
+      const bufferedUSD = calcBufferedNetUSD(netUSD, currencyBufferPercent);
+      const bufferedPHP = bufferedUSD * exchangeRate;
+      const markupPHP = calcMarkupAmountPHP(netUSD, currencyBufferPercent, exchangeRate, item.markupPercent);
+      const vatPHP = markupPHP * 0.12;
+      const clientPHP = bufferedPHP + markupPHP;
+
+      totalNetUSD += netUSD;
+      totalBufferedNetUSD += bufferedUSD;
+      totalBufferedNetPHP += bufferedPHP;
+      totalMarkupPHP += markupPHP;
+      totalVatOnMarkupPHP += vatPHP;
+      totalClientPHP += clientPHP;
+    }
+
+    return {
+      totalNetUSD,
+      totalBufferedNetUSD,
+      totalBufferedNetPHP,
+      totalMarkupPHP,
+      totalVatOnMarkupPHP,
+      totalClientPHP,
+      totalGrossProfitPHP: totalMarkupPHP,
+      totalNetProfitPHP: totalMarkupPHP - totalVatOnMarkupPHP,
+    };
+  }, [itinerary]);
+
   return (
     <ItineraryContext.Provider
-      value={{ itinerary, updateItem, lockItem, removeItem, addItem, updateAgencyName, totalNet, totalFinal }}
+      value={{
+        itinerary,
+        updateItem,
+        lockItem,
+        removeItem,
+        addItem,
+        updateAgencyName,
+        setExchangeRate,
+        setCurrencyBuffer,
+        setGlobalMarkup,
+        setPaymentStatus,
+        setTermsAccepted,
+        updateInclusions,
+        updateExclusions,
+        addVoucher,
+        removeVoucher,
+        pricing,
+        totalNet,
+        totalFinal,
+      }}
     >
       {children}
     </ItineraryContext.Provider>
